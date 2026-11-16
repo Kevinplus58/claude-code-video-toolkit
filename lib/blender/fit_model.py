@@ -23,10 +23,13 @@ fit.json (metres, in the model's own space; side joints once, for the character'
      "face": {"eyes": [[x, z], [x, z]], "eye_size": [w, h], "brows": [[x, z], [x, z]], "brow_size": [w, h],
               "mouth": [x, z], "mouth_width": w, "half_width": w, "moustache": true, "chin": z}}
 Eyes and brows are the character's right, then left, as seen from the front.
-Optional: "hands": {"model": "open_hands.glb", "scale": 0.7, "smooth": [[along, out_of_palm, across, radius]]}
+Optional: "joints_right": {"el": [x, y, z], ...}, a right-side joint where the model is not symmetrical, written
+as the left is (x positive). And "hands": {"model": "open_hands.glb", "scale": 0.7, "smooth": [[along, out_of_palm, across, radius]]}
 (hands.py: the donor's hands are sized to the body's own unless `scale` says, the wrist joint moves to the cuff
 whatever `wr` says, and `smooth` flattens a lump on both hands, in cm from the middle of the knuckle row), and in
 "face", "brows_hidden": [0] for a brow under a fringe.
+"face", "paint": "keep" leaves the painted face on the model and cuts the eyes that move from it (facepaint.py):
+for a face painted nearer to life than a cartoon, where the rig's own eyes would be twice the size and stare.
 """
 from __future__ import annotations
 
@@ -42,6 +45,7 @@ import bpy  # noqa: E402
 import numpy as np  # noqa: E402
 from mathutils import Matrix, Vector  # noqa: E402
 
+import facepaint  # noqa: E402
 import hands as hand_graft  # noqa: E402
 from character import skeleton  # noqa: E402
 
@@ -202,6 +206,56 @@ def load_donor(path: Path, centre_x: float | None):
     return ob
 
 
+def mend(ob) -> dict:
+    """Take the slivers off a welded model. A generator leaves a few stray triangles standing on the surface
+    like fins (an edge shared by three faces, the third with an open edge) and pinholes a millimetre across.
+    Under cloth nobody sees them; on a face they render as a dark triangle at a temple or a shard by an eye,
+    whichever way the light falls on the fin. The fins are deleted and the pinholes closed. Returns the counts,
+    and how many open edges are left (a real opening, such as a sleeve's end, is left alone)."""
+    bm = bmesh.new()
+    bm.from_mesh(ob.data)
+    fins = 0
+    for _ in range(4):
+        loose = {f for e in bm.edges if len(e.link_faces) > 2 for f in e.link_faces
+                 if any(x.is_boundary for x in f.edges)}
+        if not loose:
+            break
+        fins += len(loose)
+        bmesh.ops.delete(bm, geom=list(loose), context="FACES")
+    seen, holes = set(), []
+    for e in [e for e in bm.edges if e.is_boundary]:
+        if e in seen:
+            continue
+        ring, stack = [], [e]
+        seen.add(e)
+        while stack:
+            x = stack.pop()
+            ring.append(x)
+            for v in x.verts:
+                for y in v.link_edges:
+                    if y.is_boundary and y not in seen:
+                        seen.add(y)
+                        stack.append(y)
+        holes.append(ring)
+    small = [r for r in holes if len(r) <= MEND_EDGES and
+             max((a.verts[0].co - b.verts[0].co).length for a in r for b in r) < MEND_SIZE]
+    if small:
+        bmesh.ops.holes_fill(bm, edges=[e for r in small for e in r], sides=MEND_EDGES)
+    stray = [v for v in bm.verts if not v.link_faces]
+    if stray:
+        bmesh.ops.delete(bm, geom=stray, context="VERTS")
+    left = sum(1 for e in bm.edges if e.is_boundary)
+    bm.to_mesh(ob.data)
+    bm.free()
+    ob.data.update()
+    return {"fins": fins, "pinholes": len(small), "open_edges": left}
+
+
+PAINT_LOST_LIMIT = 0.002  # the share of faces that may be painted from the wrong part of the texture after the reduction
+MEND_EDGES = 8      # a hole with no more edges than this round it, and
+MEND_SIZE = 0.006   # no wider than this (m), is a pinhole the generator left, and is closed
+
+
 def face_shapes(face):
     m = 1.35  # a margin: the painted edge is soft
     out = [(x, z, face["eye_size"][0] / 2 * m, face["eye_size"][1] / 2 * m) for x, z in face["eyes"]]
@@ -230,19 +284,39 @@ def load_model(path: Path, centre_x: float, faces: int, face: dict):
     bpy.ops.mesh.select_all(action="SELECT")
     bpy.ops.mesh.remove_doubles(threshold=1e-5)  # the importer splits vertices at UV seams
     bpy.ops.object.mode_set(mode="OBJECT")
+    mended = mend(ob)
+    print(f"fit: mesh, {mended['fins']} stray faces standing on the surface removed, {mended['pinholes']} pinholes "
+          f"closed, {mended['open_edges']} open edges left")
     marks = {"eyes": [(x - centre_x, front_y(ob, x - centre_x, z), z) for x, z in face["eyes"]],
              "brows": [(x - centre_x, front_y(ob, x - centre_x, z), z) for x, z in face["brows"]],
              "mouth": (face["mouth"][0] - centre_x, front_y(ob, face["mouth"][0] - centre_x, face["mouth"][1]),
                        face["mouth"][1])}
-    erase(ob, [(x - centre_x, z, rx, rz) for x, z, rx, rz in face_shapes(face)])
+    # the painted face is read before anything is taken off it: `check` holds the rig's face against it, and
+    # with "paint": "keep" the paint stays and the eyes that move are cut from it (facepaint.py)
+    bpy.context.view_layer.update()
+    seen = facepaint.measure(ob, face, centre_x)
+    for line in facepaint.words(seen):
+        print(f"fit: painted face, {line}")
+    keep = face.get("paint") == "keep"
+    if keep and not all(seen["eyes"]):
+        raise SystemExit('fit: "paint": "keep" needs a painted eye on each side (white beside an iris) and found '
+                         "none on one: check the fit's eyes are on the model's eyes, or leave paint out")
+    if not keep:
+        erase(ob, [(x - centre_x, z, rx, rz) for x, z, rx, rz in face_shapes(face)])
     if len(ob.data.polygons) > faces:
-        dec = ob.modifiers.new("Decimate", "DECIMATE")
-        dec.ratio = faces / len(ob.data.polygons)
-        bpy.ops.object.modifier_apply(modifier=dec.name)
+        # (thinned inside the islands of its texture, never across their seams: hands.reduce says why)
+        was, made = hand_graft.surface(ob), len(ob.data.polygons)
+        held = hand_graft.reduce(ob, faces)
+        lost = hand_graft.paint_lost(ob, was)
+        print(f"fit: mesh, reduced from {made} to {len(ob.data.polygons)} faces with {held} vertices on the "
+              f"texture's seams left alone; {100 * lost:.2f}% of the faces are painted from the wrong place")
+        if lost > PAINT_LOST_LIMIT:
+            print(f"fit: FAIL mesh, {100 * lost:.1f}% of the faces lost their paint in the reduction (limit "
+                  f"{100 * PAINT_LOST_LIMIT:.1f}%): shards of the wrong colour will show, worst on the face")
     for poly in ob.data.polygons:
         poly.use_smooth = True
     ob.name = "model_body"
-    return ob, marks
+    return ob, marks, seen
 
 
 def head_mask(body, clothes):
@@ -281,9 +355,14 @@ def source_joints(fit: dict) -> dict:
     out = {"pelvis": j["pelvis"], "neckb": j["neckb"], "necktop": j["necktop"]}
     for name, t in (("waist", 0.28), ("chest", 0.59), ("upch", 0.82)):
         out[name] = j["pelvis"].lerp(j["neckb"], t)
+    # (the joints are written for the character's left and mirrored; `joints_right` gives a joint of the right
+    # side where the model is not symmetrical, written the same way, x positive. A right elbow mirrored 3 cm
+    # outside the arm puts the inside of the arm out of its sleeve, and that skin then hangs from the hip)
+    right = {k: Vector(v) for k, v in fit.get("joints_right", {}).items()}
     for s, sd in ((1, "L"), (-1, "R")):
         for k in ("sh", "el", "wr", "tip", "hip", "kn", "an", "toe"):
-            out[k + sd] = Vector((j[k].x * s, j[k].y, j[k].z))
+            at = right.get(k, j[k]) if sd == "R" else j[k]
+            out[k + sd] = Vector((at.x * s, at.y, at.z))
         out["th" + sd] = out["wr" + sd].lerp(out["tip" + sd], 0.5) + Vector((0, -0.03, 0))
     return out
 
@@ -409,6 +488,26 @@ def copy_weights(proxy, body, src, reach=0.25, smooth=14):
         np.add.at(count, edges[:, 0], 1)
         np.add.at(count, edges[:, 1], 1)
         w = total / count[:, None]
+    # The other way round from the sleeve: a forearm that hangs beside the hips in the A-pose takes some of the
+    # hip's weights (the hip's surface faces the same way as the forearm's, and smoothing spreads it along the
+    # arm). Such a vertex is held back toward the hip when the arm comes up, so the forearm's underside sags, and
+    # on a desk it goes through the top. So the arm from half way down the upper arm to the wrist is arm only,
+    # where a vertex is half arm or more already and far nearer the arm than the middle of the body (a chest or hip
+    # vertex near the arm is not half arm, and keeps its weights; the shoulder end of the upper arm keeps the
+    # spine's share a shoulder needs). Not by a tube the forearm's thickness, which is measured on the outer side:
+    # the inside of an arm can stand further off its bone (5.6 cm on a forearm measured 3.2 cm thick).
+    arm = np.array([name.split(".")[0] in ("upper", "fore", "hand") for name in names])
+    middle = np.hypot(co[:, 0], co[:, 1] - src["pelvis"].y)  # how far out from the body's middle
+    freed = 0
+    for sd in "LR":
+        half = (src["sh" + sd] + src["el" + sd]) / 2
+        d = np.minimum(to_segment(src["el" + sd], src["wr" + sd]), to_segment(half, src["el" + sd]))
+        share = w[:, arm].sum(axis=1) / np.maximum(w.sum(axis=1), 1e-6)
+        mine = np.clip((0.6 - d / np.maximum(middle, 1e-6)) / 0.25, 0, 1) * np.clip((share - 0.3) / 0.2, 0, 1)
+        freed += int(((mine > 0) & (share < 0.999)).sum())
+        w[:, ~arm] *= (1 - mine)[:, None]
+    w /= np.maximum(w.sum(axis=1), 1e-6)[:, None]
+    print(f"fit: arms, {freed} vertices from the elbow down had some of the body's weight, now the arm's")
     for sd in "LR":  # a shoe is stiff: everything below the ankle goes with the foot, blending in just above it
         foot, ankle = names.index("foot." + sd), src["an" + sd]
         side = (co[:, 0] > 0) == (ankle.x > 0)
@@ -474,6 +573,33 @@ def part_legs(body) -> int:
     return len(cut)
 
 
+ARM_JOINED_LIMIT = 5  # edges running straight from a forearm or hand to the body before the fit fails it
+
+
+def arm_joined(body) -> dict:
+    """How many edges of the mesh run straight from each forearm or hand to the body (spine, hips or a thigh),
+    each end by the bone that moves it most. On a free arm there are none: between them is the upper arm. Where
+    the inside of a forearm is left moving with the body, a sheet of skin hangs from the arm to the hip and bags
+    whenever the arm moves. Seen on a model whose right arm hung 3 cm nearer the body than its left: the elbow,
+    mirrored from the left, stood outside the arm and its inside went to the spine (29 edges; every other arm
+    measured has none). The fix is the joint: `joints_right` in the fit file."""
+    names = [g.name for g in body.vertex_groups]
+    part = []
+    for v in body.data.vertices:
+        if not v.groups:
+            part.append(None)
+            continue
+        top = names[max(v.groups, key=lambda g: g.weight).group]
+        kind = top.split(".")[0]
+        part.append(top[-1] if kind in ("fore", "hand") else ("body" if kind in ("spine", "hips", "thigh") else None))
+    out = {"L": 0, "R": 0}
+    for e in body.data.edges:
+        a, b = part[e.vertices[0]], part[e.vertices[1]]
+        if {a, b} in ({"L", "body"}, {"R", "body"}):
+            out[a if a != "body" else b] += 1
+    return out
+
+
 def preview(body, folder: Path):
     """Three stills of the fitted body (Workbench, textured), to look at before a spec is run against it."""
     sc = bpy.context.scene
@@ -503,7 +629,7 @@ def main():
     fit = json.loads(Path(args.fit).read_text(encoding="utf-8"))
 
     cx, scale = fit.get("centre_x", 0.0), float(fit.get("scale", 1.0))
-    body, marks = load_model(Path(args.model), cx, int(fit.get("faces", 150000)), fit["face"])
+    body, marks, seen = load_model(Path(args.model), cx, int(fit.get("faces", 150000)), fit["face"])
     src = source_joints(fit)
     if "arm_stretch" in fit:
         print("fit: arm_stretch is no longer used: the model keeps its own arms")
@@ -512,6 +638,15 @@ def main():
         donor_path = Path(fit["hands"]["model"])
         donor = load_donor(donor_path if donor_path.is_absolute() else Path(args.fit).resolve().parent / donor_path,
                            fit["hands"].get("centre_x"))
+        # (a hands model made from a closer picture, hips up so the hands are bigger in it, comes back sized as
+        # if it were the whole figure: the hands are looked for by lengths in metres, so it is brought to the
+        # body's arm span first)
+        span = max(abs(v.co.x) for v in body.data.vertices) / max(abs(v.co.x) for v in donor.data.vertices)
+        if abs(span - 1) > 0.15:
+            donor.data.transform(Matrix.Scale(span, 4))
+            donor.data.update()
+            print(f"fit: hands, the hands model is {1 / span:.2f}x the body's arm span: scaled to match before "
+                  "its hands are looked for")
         fingers, pieces = hand_graft.graft(body, donor, src, int(fit["hands"].get("faces", 9000)),
                                            float(fit["hands"]["scale"]) if "scale" in fit["hands"] else None,
                                            lumps=fit["hands"].get("smooth", ()))
@@ -524,8 +659,19 @@ def main():
     parted = part_legs(body)
     if parted:
         print(f"fit: the legs touched in the model: {parted} faces joining one to the other were cut")
+    for sd, joined in arm_joined(body).items():
+        if joined > ARM_JOINED_LIMIT:
+            print(f"fit: FAIL weights, the inside of the {'left' if sd == 'L' else 'right'} forearm moves with the body: "
+                  f"{joined} edges run from it straight to the body (limit {ARM_JOINED_LIMIT}), and the skin will hang "
+                  "from the arm to the hip as it moves. The elbow or wrist is likely off the arm: measure that side's "
+                  "arm by slices and give its joints in `joints_right` (or correct `joints`)")
     if pieces:
-        hand_graft.join(body, pieces)
+        for before, after in hand_graft.seal(body, pieces):
+            print(f"fit: hands, a bare arm's end drawn in onto the hand: the ring stood {1000 * before:.1f} mm off "
+                  f"the hand's skin, now {1000 * after:.1f} mm")
+        ring = hand_graft.join(body, pieces)
+        if ring:
+            print(f"fit: hands, {ring} vertices on the ring where a bare arm meets its hand share their normals")
         body["hand_material"] = len(body.data.materials) - 1  # (the rig measures a hand's whole skin by it)
     body.data.transform(Matrix.Scale(scale, 4))  # the whole model, evenly: nothing is stretched or re-posed
     lift = -min(v.co.z for v in body.data.vertices)  # soles on the floor
@@ -556,7 +702,8 @@ def main():
         "half_width": face["half_width"] * scale, "moustache": bool(face.get("moustache")),
         # the chin's underside (the jaw key moves what is between it and the lips): given, or a mouth's width down
         "chin": placed((0, 0, face["chin"])).z if "chin" in face
-        else on_head(marks["mouth"])[2] - 1.2 * face["mouth_width"] * scale})
+        else on_head(marks["mouth"])[2] - 1.2 * face["mouth_width"] * scale,
+        **facepaint.store(seen, placed, scale, fit.get("gamma"), keep=face.get("paint") == "keep")})
     if args.preview:
         preview(body, Path(args.preview))
     bpy.ops.file.pack_all()
